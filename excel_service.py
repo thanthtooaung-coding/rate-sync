@@ -1,4 +1,4 @@
-"""Excel persistence for exchange-rate records."""
+"""Excel persistence for multi-source exchange-rate records."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
 from config import EXCEL_PATH, ensure_directories
+from models import RateRecord, SourceKind
 from parser import ExchangeRate
 
 AVG_SHEET_NAME: str = "Avg Rate"
@@ -23,17 +24,17 @@ AVG_HEADERS: tuple[str, ...] = (
     "Avg Buy 10Lakh",
     "Avg Sell",
     "Avg Sell Alt",
-    "Channels",
+    "Sources",
 )
 
-CHANNEL_HEADERS: tuple[str, ...] = (
+SOURCE_HEADERS: tuple[str, ...] = (
     "Date",
     "Time",
     "Buy 5Lakh",
     "Buy 10Lakh",
     "Sell",
     "Sell Alt",
-    "Telegram Message ID",
+    "Message ID",
     "Raw Message",
 )
 
@@ -41,68 +42,86 @@ MESSAGE_ID_COLUMN: int = 7
 _INVALID_SHEET_CHARS: re.Pattern[str] = re.compile(r"[\\/*?:\[\]]")
 
 
-def sheet_name_for_channel(channel: str) -> str:
-    """Build an Excel sheet title for a channel.
-
-    Prefers ``{channel}'s Exchange Rate``. Falls back to shorter forms when
-    the Excel 31-character sheet-name limit would be exceeded.
+def sheet_name_for_source(source: SourceKind, source_key: str) -> str:
+    """Build an Excel sheet title for a Telegram channel or Facebook page.
 
     Args:
-        channel: Telegram channel username.
+        source: Platform kind.
+        source_key: Channel username or Facebook page id/name.
 
     Returns:
-        A safe sheet title for the channel.
+        A safe sheet title (max 31 characters).
     """
-    safe: str = _INVALID_SHEET_CHARS.sub("_", channel.strip().lstrip("@"))
-    for suffix in ("'s Exchange Rate", "'s Rates", ""):
-        title: str = f"{safe}{suffix}" if suffix else safe
+    safe: str = _INVALID_SHEET_CHARS.sub("_", source_key.strip().lstrip("@"))
+    if source is SourceKind.FACEBOOK:
+        candidates: tuple[str, ...] = (
+            f"FB {safe}'s Exchange Rate",
+            f"FB {safe}'s Rates",
+            f"FB {safe}",
+            safe,
+        )
+    else:
+        candidates = (
+            f"{safe}'s Exchange Rate",
+            f"{safe}'s Rates",
+            safe,
+        )
+
+    for title in candidates:
         if len(title) <= 31:
             return title
-    return safe[:31]
+    prefix: str = "FB " if source is SourceKind.FACEBOOK else ""
+    return f"{prefix}{safe}"[:31]
 
 
-@dataclass(frozen=True)
-class RateRecord:
-    """A single exchange-rate row ready for Excel."""
-
-    channel: str
-    message_id: int
-    message_date: datetime
-    rates: ExchangeRate
-    raw_message: str
+def storage_key(source: SourceKind, source_key: str) -> str:
+    """Build a unique in-memory key for a source feed."""
+    return f"{source.value}:{source_key.strip().lstrip('@').lower()}"
 
 
 @dataclass(frozen=True)
 class AverageRate:
-    """Averaged rates across channels that currently have data."""
+    """Averaged rates across feeds that currently have data."""
 
     buy_5_lakh: float
     buy_10_lakh: float
     sell: float
     sell_alt: float | None
-    channels_used: int
+    sources_used: int
 
 
 @dataclass
 class ExcelService:
-    """Persist rates into an Avg Rate sheet plus per-channel sheets."""
+    """Persist rates into Avg Rate + Telegram sheets + Facebook sheets."""
 
-    channels: list[str]
+    telegram_channels: list[str]
+    facebook_pages: list[str] = field(default_factory=list)
     path: Path = EXCEL_PATH
-    _known_ids: dict[str, set[int]] = field(default_factory=dict, init=False)
+    _known_ids: dict[str, set[str]] = field(default_factory=dict, init=False)
     _latest_rates: dict[str, ExchangeRate] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         """Ensure workbook/sheets exist and load known message IDs."""
-        if not self.channels:
-            raise ValueError("At least one channel is required")
+        if not self.telegram_channels and not self.facebook_pages:
+            raise ValueError("At least one Telegram channel or Facebook page is required")
         ensure_directories()
         self._ensure_workbook()
         self._known_ids = self._load_existing_message_ids()
         self._latest_rates = self._load_latest_rates()
 
+    @property
+    def _feed_specs(self) -> list[tuple[SourceKind, str]]:
+        """Return configured feeds in sheet order: Telegram then Facebook."""
+        specs: list[tuple[SourceKind, str]] = [
+            (SourceKind.TELEGRAM, channel) for channel in self.telegram_channels
+        ]
+        specs.extend(
+            (SourceKind.FACEBOOK, page) for page in self.facebook_pages
+        )
+        return specs
+
     def _create_workbook(self) -> None:
-        """Create Avg Rate first, then one sheet per channel."""
+        """Create Avg Rate first, then Telegram sheets, then Facebook sheets."""
         workbook: Workbook = Workbook()
         default_sheet: Worksheet = workbook.active
         workbook.remove(default_sheet)
@@ -110,9 +129,11 @@ class ExcelService:
         avg_sheet: Worksheet = workbook.create_sheet(title=AVG_SHEET_NAME, index=0)
         avg_sheet.append(list(AVG_HEADERS))
 
-        for channel in self.channels:
-            sheet: Worksheet = workbook.create_sheet(title=sheet_name_for_channel(channel))
-            sheet.append(list(CHANNEL_HEADERS))
+        for source, key in self._feed_specs:
+            sheet: Worksheet = workbook.create_sheet(
+                title=sheet_name_for_source(source, key)
+            )
+            sheet.append(list(SOURCE_HEADERS))
 
         workbook.save(self.path)
 
@@ -123,7 +144,7 @@ class ExcelService:
         )
 
     def _workbook_schema_ok(self, workbook: Workbook) -> bool:
-        """Validate Avg Rate + at least one channel sheet schema."""
+        """Validate Avg Rate + configured source sheet schemas."""
         if AVG_SHEET_NAME not in workbook.sheetnames:
             return False
         avg_headers: tuple[object | None, ...] = self._row_headers(
@@ -132,22 +153,38 @@ class ExcelService:
         if avg_headers[: len(AVG_HEADERS)] != AVG_HEADERS:
             return False
 
-        for channel in self.channels:
-            title: str = sheet_name_for_channel(channel)
+        for source, key in self._feed_specs:
+            title: str = sheet_name_for_source(source, key)
             if title not in workbook.sheetnames:
                 continue
-            channel_headers: tuple[object | None, ...] = self._row_headers(workbook[title])
-            if channel_headers[: len(CHANNEL_HEADERS)] != CHANNEL_HEADERS:
+            headers: tuple[object | None, ...] = self._row_headers(workbook[title])
+            if headers[: len(SOURCE_HEADERS)] != SOURCE_HEADERS:
                 return False
         return True
 
     def _ensure_avg_first(self, workbook: Workbook) -> None:
         """Move Avg Rate sheet to index 0."""
         if AVG_SHEET_NAME in workbook.sheetnames:
-            workbook.move_sheet(AVG_SHEET_NAME, offset=-workbook.sheetnames.index(AVG_SHEET_NAME))
+            workbook.move_sheet(
+                AVG_SHEET_NAME,
+                offset=-workbook.sheetnames.index(AVG_SHEET_NAME),
+            )
+
+    def _ensure_sheet_order(self, workbook: Workbook) -> None:
+        """Reorder sheets: Avg Rate, Telegram feeds, Facebook feeds."""
+        self._ensure_avg_first(workbook)
+        desired: list[str] = [AVG_SHEET_NAME] + [
+            sheet_name_for_source(source, key) for source, key in self._feed_specs
+        ]
+        for index, title in enumerate(desired):
+            if title not in workbook.sheetnames:
+                continue
+            current_index: int = workbook.sheetnames.index(title)
+            if current_index != index:
+                workbook.move_sheet(title, offset=index - current_index)
 
     def _ensure_workbook(self) -> None:
-        """Create the workbook and ensure Avg Rate + channel sheets exist."""
+        """Create the workbook and ensure all expected sheets exist."""
         if not self.path.exists():
             self._create_workbook()
             return
@@ -165,37 +202,35 @@ class ExcelService:
         if AVG_SHEET_NAME not in workbook.sheetnames:
             avg_sheet: Worksheet = workbook.create_sheet(title=AVG_SHEET_NAME, index=0)
             avg_sheet.append(list(AVG_HEADERS))
-        else:
-            self._ensure_avg_first(workbook)
 
-        for channel in self.channels:
-            title: str = sheet_name_for_channel(channel)
+        for source, key in self._feed_specs:
+            title: str = sheet_name_for_source(source, key)
             if title not in workbook.sheetnames:
                 sheet: Worksheet = workbook.create_sheet(title=title)
-                sheet.append(list(CHANNEL_HEADERS))
+                sheet.append(list(SOURCE_HEADERS))
 
+        self._ensure_sheet_order(workbook)
         workbook.save(self.path)
         workbook.close()
 
-    def _channel_key(self, channel: str) -> str:
-        """Normalize channel usernames for lookups."""
-        return channel.strip().lstrip("@").lower()
+    def _title_to_storage_key(self) -> dict[str, str]:
+        """Map sheet titles to storage keys for configured feeds."""
+        return {
+            sheet_name_for_source(source, key): storage_key(source, key)
+            for source, key in self._feed_specs
+        }
 
-    def _load_existing_message_ids(self) -> dict[str, set[int]]:
-        """Load Telegram message IDs already stored per channel sheet."""
+    def _load_existing_message_ids(self) -> dict[str, set[str]]:
+        """Load message IDs already stored per source sheet."""
         workbook = load_workbook(self.path, read_only=True, data_only=True)
-        known: dict[str, set[int]] = {
-            self._channel_key(channel): set() for channel in self.channels
+        known: dict[str, set[str]] = {
+            storage_key(source, key): set() for source, key in self._feed_specs
         }
-
-        title_to_channel: dict[str, str] = {
-            sheet_name_for_channel(channel): self._channel_key(channel)
-            for channel in self.channels
-        }
+        title_map: dict[str, str] = self._title_to_storage_key()
 
         for sheet in workbook.worksheets:
-            channel_key: str | None = title_to_channel.get(sheet.title)
-            if channel_key is None:
+            feed_key: str | None = title_map.get(sheet.title)
+            if feed_key is None:
                 continue
             for row in sheet.iter_rows(
                 min_row=2,
@@ -206,21 +241,18 @@ class ExcelService:
                 value = row[0]
                 if value is None:
                     continue
-                try:
-                    known[channel_key].add(int(value))
-                except (TypeError, ValueError):
-                    continue
+                known[feed_key].add(str(value))
 
         workbook.close()
         return known
 
     def _load_latest_rates(self) -> dict[str, ExchangeRate]:
-        """Load the newest rate row from each channel sheet."""
+        """Load the newest rate row from each configured source sheet."""
         workbook = load_workbook(self.path, read_only=True, data_only=True)
         latest: dict[str, ExchangeRate] = {}
 
-        for channel in self.channels:
-            title: str = sheet_name_for_channel(channel)
+        for source, key in self._feed_specs:
+            title: str = sheet_name_for_source(source, key)
             if title not in workbook.sheetnames:
                 continue
             sheet: Worksheet = workbook[title]
@@ -244,17 +276,23 @@ class ExcelService:
                     sell_alt=sell_alt,
                 )
             if last_rate is not None:
-                latest[self._channel_key(channel)] = last_rate
+                latest[storage_key(source, key)] = last_rate
 
         workbook.close()
         return latest
 
-    def has_message(self, channel: str, message_id: int) -> bool:
-        """Check whether a Telegram message ID is already stored for a channel."""
-        return message_id in self._known_ids.get(self._channel_key(channel), set())
+    def has_message(
+        self,
+        source: SourceKind,
+        source_key: str,
+        message_id: str,
+    ) -> bool:
+        """Check whether a message ID is already stored for a feed."""
+        key: str = storage_key(source, source_key)
+        return message_id in self._known_ids.get(key, set())
 
     def compute_average(self) -> AverageRate | None:
-        """Average the latest rates across channels that have data."""
+        """Average the latest rates across all feeds that have data."""
         rates: list[ExchangeRate] = list(self._latest_rates.values())
         if not rates:
             return None
@@ -270,18 +308,11 @@ class ExcelService:
             sell_alt=(
                 round(sum(sell_alts) / len(sell_alts), 2) if sell_alts else None
             ),
-            channels_used=count,
+            sources_used=count,
         )
 
     def write_average_snapshot(self, as_of: datetime | None = None) -> bool:
-        """Append current cross-channel average to the Avg Rate sheet.
-
-        Args:
-            as_of: Timestamp for the snapshot. Defaults to now.
-
-        Returns:
-            True if a row was written.
-        """
+        """Append current cross-source average to the Avg Rate sheet."""
         average: AverageRate | None = self.compute_average()
         if average is None:
             return False
@@ -303,7 +334,7 @@ class ExcelService:
                 average.buy_10_lakh,
                 average.sell,
                 average.sell_alt if average.sell_alt is not None else "",
-                average.channels_used,
+                average.sources_used,
             ]
         )
         workbook.save(self.path)
@@ -311,24 +342,17 @@ class ExcelService:
         return True
 
     def append_record(self, record: RateRecord, *, update_average: bool = False) -> bool:
-        """Append a rate record to the channel sheet if it is not a duplicate.
-
-        Args:
-            record: Parsed rate record to store.
-            update_average: When True, also append an Avg Rate snapshot.
-
-        Returns:
-            True if a channel row was inserted, False if skipped as duplicate.
-        """
-        channel_key: str = self._channel_key(record.channel)
-        if self.has_message(channel_key, record.message_id):
+        """Append a rate record to the matching source sheet if new."""
+        key: str = storage_key(record.source, record.source_key)
+        if self.has_message(record.source, record.source_key, record.message_id):
             return False
 
         workbook = load_workbook(self.path)
-        title: str = sheet_name_for_channel(record.channel)
+        title: str = sheet_name_for_source(record.source, record.source_key)
         if title not in workbook.sheetnames:
             sheet: Worksheet = workbook.create_sheet(title=title)
-            sheet.append(list(CHANNEL_HEADERS))
+            sheet.append(list(SOURCE_HEADERS))
+            self._ensure_sheet_order(workbook)
         else:
             sheet = workbook[title]
 
@@ -347,8 +371,8 @@ class ExcelService:
         workbook.save(self.path)
         workbook.close()
 
-        self._known_ids.setdefault(channel_key, set()).add(record.message_id)
-        self._latest_rates[channel_key] = record.rates
+        self._known_ids.setdefault(key, set()).add(record.message_id)
+        self._latest_rates[key] = record.rates
 
         if update_average:
             self.write_average_snapshot(record.message_date)
@@ -358,11 +382,9 @@ class ExcelService:
         """Append multiple records, skipping duplicates."""
         inserted: int = 0
         skipped: int = 0
-
         for record in records:
             if self.append_record(record):
                 inserted += 1
             else:
                 skipped += 1
-
         return inserted, skipped

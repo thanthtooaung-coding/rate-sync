@@ -1,24 +1,26 @@
 # rate-sync
 
-Monitors Telegram exchange-rate channels with your personal Telegram account (Telethon), parses rates, and writes them to Excel.
+Monitors Telegram channels and optional Facebook pages for exchange-rate posts, parses rates, and writes them to Excel.
 
 ## Features
 
-- Login with Telegram Client API (not a bot)
-- Listen to one or more public channels
-- Backfill the latest 100 messages on startup, then listen live
-- Parse Myanmar-format rate posts (and legacy English Buying/Selling/Cash)
-- Excel workbook with:
-  - **Avg Rate** (first sheet) — average of each channel’s latest rates
-  - **`{channel}'s Exchange Rate`** — per-channel history
-- Skip duplicate Telegram message IDs per channel
-- Auto-reconnect and graceful Ctrl+C shutdown
+- Multi-source architecture: Telegram (Telethon) + Facebook (Graph API polling)
+- Shared parser and Excel pipeline
+- Workbook layout:
+  1. **Avg Rate** — average of each feed’s latest rates (Telegram + Facebook)
+  2. Telegram channel sheets
+  3. Facebook page sheets
+- Backfill recent posts on startup, then listen/poll live
+- Skip duplicate message IDs per feed
+- Auto-reconnect (Telegram) and resilient poll retries (Facebook)
 - Console + `logs/app.log` logging
 
 ## Requirements
 
 - Python 3.12+
+- Neon PostgreSQL database
 - Telegram API credentials from [my.telegram.org](https://my.telegram.org)
+- Optional: Facebook Page Access Token + Page ID(s) from [Meta for Developers](https://developers.facebook.com/)
 
 ## Setup
 
@@ -28,27 +30,37 @@ Monitors Telegram exchange-rate channels with your personal Telegram account (Te
 pip install -r requirements.txt
 ```
 
-2. Create `.env` in the project root:
+2. Put your Neon connection string in `.env`:
 
 ```env
-API_ID=your_api_id
-API_HASH=your_api_hash
-CHANNEL_USERNAME=
+DATABASE_URL=postgresql://USER:PASSWORD@HOST/neondb?sslmode=require
 ```
 
-Multiple channels (comma-separated):
+3. Seed Telegram/Facebook settings into Neon (one-time):
 
-```env
-CHANNEL_USERNAME=firstchannel,anotherchannel
+```bash
+python seed_settings.py --api-id YOUR_API_ID --api-hash YOUR_API_HASH --channels dimyanmarexchange
 ```
 
-3. Run:
+Optional Facebook:
+
+```bash
+python seed_settings.py --api-id YOUR_API_ID --api-hash YOUR_API_HASH --channels dimyanmarexchange --facebook-token EAAB... --facebook-pages 1234567890
+```
+
+Multiple channels/pages: comma-separated in `--channels` / `--facebook-pages`.
+
+Settings live in the `app_settings` table. Re-run `seed_settings.py` anytime to update them.
+
+4. Run:
 
 ```bash
 python app.py
 ```
 
-On first run, Telethon asks for your phone number and login code (sent inside Telegram). The session is saved under `session/` so you are not asked again.
+On first run, Telethon asks for your phone number and login code (sent inside Telegram). The session is saved under `session/`.
+
+Facebook is enabled only when both `facebook_access_token` and `facebook_page_ids` are set in the database.
 
 ## Excel output
 
@@ -56,23 +68,51 @@ File: `data/exchange.xlsx`
 
 ### Sheet 1 — Avg Rate
 
-| Date | Time | Avg Buy 5Lakh | Avg Buy 10Lakh | Avg Sell | Avg Sell Alt | Channels |
-|------|------|---------------|----------------|----------|--------------|----------|
+| Date | Time | Avg Buy 5Lakh | Avg Buy 10Lakh | Avg Sell | Avg Sell Alt | Sources |
+|------|------|---------------|----------------|----------|--------------|---------|
 
-Updated once after historical download, then again on each live rate insert.
+Updated once after historical download, then again on each live insert.
 
-### Sheet 2+ — per channel
+### Telegram sheets
 
-Sheet name examples:
+Names like `dimyanmarexchange's Rates` (Excel 31-char limit).
 
-- `shortname's Exchange Rate`
+| Date | Time | Buy 5Lakh | Buy 10Lakh | Sell | Sell Alt | Message ID | Raw Message |
+|------|------|-----------|------------|------|----------|------------|-------------|
 
-| Date | Time | Buy 5Lakh | Buy 10Lakh | Sell | Sell Alt | Telegram Message ID | Raw Message |
-|------|------|-----------|------------|------|----------|---------------------|-------------|
+### Facebook sheets
+
+Names like `FB SomePage's Rates`.
+
+Same columns as Telegram sheets.
+
+## Architecture
+
+```text
+app.py
+  ├── services/telegram_service.py
+  ├── services/facebook_service.py
+  ├── services/rate_pipeline.py
+  ├── excel_service.py
+  ├── parser.py
+  ├── models.py
+  ├── db.py                  # Neon app_settings access
+  ├── seed_settings.py       # one-time / update settings seeder
+  └── config.py              # loads settings from database
+```
+
+## Facebook token tips
+
+1. Create a Meta app and add the **Facebook Login** / **Pages** products as needed.
+2. Generate a **Page Access Token** with permission to read page posts (e.g. `pages_read_engagement`).
+3. Find the Page ID in Page settings → About, or via Graph API Explorer.
+4. Put token + page id(s) in `.env`, then restart the app.
+
+Polling interval defaults to 300 seconds (5 minutes).
 
 ## Parsed message format
 
-Example channel post:
+Example post:
 
 ```text
 📌 ကျပ်ပေး ဘတ်ယူ
@@ -87,29 +127,33 @@ Example channel post:
 | Buy 5Lakh | `၅ သိန်းအထက်` |
 | Buy 10Lakh | `၁၀ သိန်း အထက်` |
 | Sell | first number in `ဘတ်ပေး ကျပ်ယူ` |
-| Sell Alt | second number when present (`775 / 773`) |
+| Sell Alt | second number when present |
 
 ## Project structure
 
 ```text
 rate-sync/
-├── app.py              # Telethon listener + orchestration
-├── config.py           # .env settings
-├── parser.py           # Rate parsing
-├── excel_service.py    # Excel read/write
-├── logger.py           # Console + file logging
+├── app.py
+├── config.py
+├── db.py
+├── seed_settings.py
+├── models.py
+├── parser.py
+├── excel_service.py
+├── logger.py
+├── services/
+│   ├── telegram_service.py
+│   ├── facebook_service.py
+│   └── rate_pipeline.py
 ├── requirements.txt
-├── .env
+├── .env                 # DATABASE_URL only
 ├── data/
-│   └── exchange.xlsx
 ├── session/
-│   └── telegram.session
 └── logs/
-    └── app.log
 ```
 
 ## Notes
 
-- You must already be able to view the target channels with your Telegram account.
-- Do not commit `.env` or `*.session` files (they are gitignored).
-- Stop the app with `Ctrl+C`.
+- You must already be able to view the Telegram channels with your account.
+- Do not commit `.env` or `*.session` files.
+- Stop with `Ctrl+C`.
