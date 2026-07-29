@@ -1,4 +1,4 @@
-"""Facebook Graph API page-post polling service."""
+"""Facebook page polling: Graph API (admin) or public scrape (normal login)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import httpx
 from config import HISTORICAL_MESSAGE_LIMIT, Settings
 from logger import get_logger
 from models import SourceKind, SourcePost
+from services.facebook_public import scrape_page_posts, scraped_to_graph_shape
 from services.rate_pipeline import RatePipeline
 
 logger = get_logger()
@@ -21,7 +22,7 @@ GRAPH_API_BASE: str = "https://graph.facebook.com/v21.0"
 
 @dataclass
 class FacebookService:
-    """Poll Facebook page posts and forward them to the rate pipeline."""
+    """Poll Facebook pages and forward posts to the rate pipeline."""
 
     settings: Settings
     pipeline: RatePipeline
@@ -30,45 +31,43 @@ class FacebookService:
 
     @property
     def enabled(self) -> bool:
-        """Return True when Facebook credentials are configured."""
+        """Return True when at least one Facebook page is configured."""
         return self.settings.facebook_enabled
+
+    @property
+    def use_graph_api(self) -> bool:
+        """Return True when a Page access token is configured."""
+        return bool(self.settings.facebook_access_token)
 
     async def download_history(self) -> None:
         """Fetch recent posts for each configured page once at startup."""
         if not self.enabled:
-            logger.info("Facebook sync disabled (token/pages not configured)")
+            logger.info("Facebook sync disabled (no facebook_page_ids configured)")
             return
 
+        mode: str = "graph" if self.use_graph_api else "public-scrape"
         logger.info(
-            "Facebook sync enabled for pages: %s",
+            "Facebook sync enabled (%s) for pages: %s",
+            mode,
             ", ".join(self.settings.facebook_page_ids),
         )
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            for page_id in self.settings.facebook_page_ids:
-                logger.info(
-                    "Downloading latest %s Facebook posts from %s",
-                    HISTORICAL_MESSAGE_LIMIT,
-                    page_id,
-                )
-                try:
-                    posts = await self._fetch_posts(
-                        client,
-                        page_id,
-                        limit=HISTORICAL_MESSAGE_LIMIT,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.error(
-                        "Facebook history fetch failed for %s: %s",
-                        page_id,
-                        exc,
-                    )
-                    continue
+        for page_id in self.settings.facebook_page_ids:
+            logger.info(
+                "Downloading latest %s Facebook posts from %s",
+                HISTORICAL_MESSAGE_LIMIT,
+                page_id,
+            )
+            try:
+                posts = await self._fetch_posts(page_id, limit=HISTORICAL_MESSAGE_LIMIT)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Facebook history fetch failed for %s: %s", page_id, exc)
+                continue
 
-                for post in reversed(posts):
-                    await self._emit_post(page_id, post, origin="history")
+            for post in reversed(posts):
+                await self._emit_post(page_id, post, origin="history")
 
-                logger.info("Facebook historical download complete for %s", page_id)
+            logger.info("Facebook historical download complete for %s", page_id)
 
     async def start_polling(self) -> None:
         """Start the background poll loop (no-op when Facebook is disabled)."""
@@ -76,8 +75,9 @@ class FacebookService:
             return
         self._task = asyncio.create_task(self._poll_loop(), name="facebook-poller")
         logger.info(
-            "Facebook poller started (interval=%ss)",
+            "Facebook poller started (interval=%ss, mode=%s)",
             self.settings.facebook_poll_interval_seconds,
+            "graph" if self.use_graph_api else "public-scrape",
         )
 
     async def _poll_loop(self) -> None:
@@ -94,42 +94,48 @@ class FacebookService:
             if self._shutdown_event.is_set():
                 break
 
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                for page_id in self.settings.facebook_page_ids:
-                    try:
-                        posts = await self._fetch_posts(
-                            client,
-                            page_id,
-                            limit=HISTORICAL_MESSAGE_LIMIT,
-                        )
-                        for post in reversed(posts):
-                            await self._emit_post(page_id, post, origin="live")
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error(
-                            "Facebook poll failed for %s: %s",
-                            page_id,
-                            exc,
-                        )
+            for page_id in self.settings.facebook_page_ids:
+                try:
+                    posts = await self._fetch_posts(
+                        page_id,
+                        limit=HISTORICAL_MESSAGE_LIMIT,
+                    )
+                    for post in reversed(posts):
+                        await self._emit_post(page_id, post, origin="live")
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Facebook poll failed for %s: %s", page_id, exc)
 
     async def _fetch_posts(
         self,
-        client: httpx.AsyncClient,
+        page_id: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch posts via Graph API or public scrape."""
+        if self.use_graph_api:
+            return await self._fetch_posts_graph(page_id, limit=limit)
+        scraped = await scrape_page_posts(page_id, limit=limit)
+        return [scraped_to_graph_shape(post) for post in scraped]
+
+    async def _fetch_posts_graph(
+        self,
         page_id: str,
         *,
         limit: int,
     ) -> list[dict[str, Any]]:
         """Fetch recent posts for a page from the Graph API."""
         assert self.settings.facebook_access_token is not None
-        response = await client.get(
-            f"{GRAPH_API_BASE}/{page_id}/posts",
-            params={
-                "fields": "id,message,created_time",
-                "limit": limit,
-                "access_token": self.settings.facebook_access_token,
-            },
-        )
-        response.raise_for_status()
-        payload: dict[str, Any] = response.json()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{GRAPH_API_BASE}/{page_id}/posts",
+                params={
+                    "fields": "id,message,created_time",
+                    "limit": limit,
+                    "access_token": self.settings.facebook_access_token,
+                },
+            )
+            response.raise_for_status()
+            payload: dict[str, Any] = response.json()
         if "error" in payload:
             error = payload["error"]
             raise RuntimeError(f"Graph API error: {error.get('message', error)}")
@@ -143,7 +149,7 @@ class FacebookService:
         *,
         origin: str,
     ) -> None:
-        """Convert a Graph API post into a SourcePost and process it."""
+        """Convert a post dict into a SourcePost and process it."""
         message_id: str = str(post.get("id") or "")
         text: str = str(post.get("message") or "")
         if not message_id:

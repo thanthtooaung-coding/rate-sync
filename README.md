@@ -42,7 +42,16 @@ DATABASE_URL=postgresql://USER:PASSWORD@HOST/neondb?sslmode=require
 python seed_settings.py --api-id YOUR_API_ID --api-hash YOUR_API_HASH --channels dimyanmarexchange
 ```
 
-Optional Facebook:
+Facebook **without Page admin** (public scrape via your personal Facebook login):
+
+```bash
+pip install playwright
+playwright install chromium
+python facebook_login.py
+python seed_settings.py --api-id YOUR_API_ID --api-hash YOUR_API_HASH --channels dimyanmarexchange --facebook-pages dimyanmar.org
+```
+
+Facebook **with Page admin** (official Graph API — optional token):
 
 ```bash
 python seed_settings.py --api-id YOUR_API_ID --api-hash YOUR_API_HASH --channels dimyanmarexchange --facebook-token EAAB... --facebook-pages 1234567890
@@ -60,7 +69,12 @@ python app.py
 
 On first run, Telethon asks for your phone number and login code (sent inside Telegram). The session is saved under `session/`.
 
-Facebook is enabled only when both `facebook_access_token` and `facebook_page_ids` are set in the database.
+Facebook modes:
+- `facebook_page_ids` only → public scrape (requires `python facebook_login.py` once)
+- `facebook_page_ids` + `facebook_access_token` → Graph API
+- neither → Facebook disabled
+
+Public scrape is unofficial and may break when Facebook changes their UI.
 
 ## Excel output
 
@@ -101,12 +115,13 @@ app.py
   └── config.py              # loads settings from database
 ```
 
-## Facebook token tips
+## Facebook token tips (admin only)
 
-1. Create a Meta app and add the **Facebook Login** / **Pages** products as needed.
-2. Generate a **Page Access Token** with permission to read page posts (e.g. `pages_read_engagement`).
-3. Find the Page ID in Page settings → About, or via Graph API Explorer.
-4. Put token + page id(s) in `.env`, then restart the app.
+1. Create a Meta app and add Pages products as needed.
+2. Generate a **Page Access Token** with permission to read page posts.
+3. Put token + page id(s) in Neon via `seed_settings.py`.
+
+If you are **not** a Page admin, use `python facebook_login.py` instead (personal login session + public scrape).
 
 Polling interval defaults to 300 seconds (5 minutes).
 

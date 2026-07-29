@@ -51,15 +51,15 @@ class RateSyncApp:
             logger.info("Watching Telegram @%s (sheet=%s)", channel, title)
 
         if self.settings.facebook_enabled:
-            print("Facebook sheets:")
+            print(f"Facebook sheets: (mode={self.settings.facebook_mode})")
             for page_id in self.settings.facebook_page_ids:
                 title = sheet_name_for_source(SourceKind.FACEBOOK, page_id)
                 print(f"  {page_id} -> '{title}'")
                 logger.info("Watching Facebook page %s (sheet=%s)", page_id, title)
         else:
             print(
-                "Facebook sheets: (disabled — set FACEBOOK_ACCESS_TOKEN "
-                "+ FACEBOOK_PAGE_IDS)"
+                "Facebook sheets: (disabled — set facebook_page_ids in Neon; "
+                "for non-admin pages run python facebook_login.py first)"
             )
 
     async def start(self) -> None:

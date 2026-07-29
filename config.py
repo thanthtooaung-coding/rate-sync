@@ -36,8 +36,15 @@ class Settings:
 
     @property
     def facebook_enabled(self) -> bool:
-        """Return True when Facebook token and page IDs are configured."""
-        return bool(self.facebook_access_token and self.facebook_page_ids)
+        """Return True when at least one Facebook page id/slug is configured."""
+        return bool(self.facebook_page_ids)
+
+    @property
+    def facebook_mode(self) -> str:
+        """Return ``graph`` when a token exists, otherwise ``public`` scrape."""
+        if not self.facebook_enabled:
+            return "disabled"
+        return "graph" if self.facebook_access_token else "public"
 
 
 def _parse_list(raw: str | None) -> tuple[str, ...]:
@@ -96,12 +103,6 @@ def load_settings() -> Settings:
     )
     if poll_interval < 30:
         raise ValueError("facebook_poll_interval_seconds must be at least 30")
-
-    if bool(facebook_token) ^ bool(facebook_pages):
-        raise ValueError(
-            "Facebook requires both facebook_access_token and facebook_page_ids, "
-            "or leave both empty to disable Facebook sync"
-        )
 
     return Settings(
         api_id=row.api_id,
